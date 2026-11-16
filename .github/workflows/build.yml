@@ -1,0 +1,126 @@
+name: Build Telegram macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-main
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 350
+    steps:
+      - name: Select Xcode
+        id: xcode
+        run: |
+          set -euo pipefail
+          echo "可用 Xcode："
+          ls -d /Applications/Xcode*.app || true
+          PICK=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$PICK" ]; then
+            PICK=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          fi
+          echo "选中：$PICK"
+          sudo xcode-select -s "$PICK/Contents/Developer"
+          xcodebuild -version
+          echo "major=$(xcodebuild -version | head -1 | awk '{print $2}' | cut -d. -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Clone Telegram source at pinned commit
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://gitlab.com/".insteadOf "git@gitlab.com:"
+          git clone --branch master https://github.com/TelegramMessenger/telegram-macos.git src
+          cd src
+          git checkout eedc963978f3416d34a5b91e81cb4186a7f67438
+          git log -1 --format='BUILD_COMMIT: %H  %ad' --date=iso
+          git submodule sync --recursive
+          git submodule update --init --recursive --jobs 8
+          INIT=$(git submodule status --recursive | grep -c '^-' || true)
+          TOTAL=$(git submodule status --recursive | wc -l | tr -d ' ')
+          echo "子模块总数：${TOTAL} / 未初始化：${INIT}"
+          if [ "${INIT}" != "0" ]; then
+            git submodule status --recursive | grep '^-' || true
+          fi
+
+      - name: Apply local patch
+        env:
+          PATCH: ${{ secrets.LOCAL_PATCH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PATCH:-}" ]; then echo "缺少 LOCAL_PATCH secret"; exit 1; fi
+          printf '%s\n' "$PATCH" > /tmp/local-changes.patch
+          cd src
+          git apply /tmp/local-changes.patch
+          echo "patch 应用完成"
+          git --no-pager diff --stat | tail -3
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          brew install cmake ninja meson nasm yasm zlib autoconf libtool automake pkg-config
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Xcode 27 compatibility patch
+        if: steps.xcode.outputs.major >= 27
+        run: |
+          set -euo pipefail
+          cd src
+          sh scripts/xcode27.sh apply
+          xcodebuild -showComponent MetalToolchain || xcodebuild -downloadComponent MetalToolchain
+
+      - name: Build native frameworks
+        run: |
+          set -euo pipefail
+          cd src
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          export CMAKE_POLICY_VERSION_MINIMUM=3.5
+          export PATH="$HOME/.cargo/bin:$PATH"
+          sh scripts/configure_frameworks.sh
+
+      - name: Archive app
+        run: |
+          set -euo pipefail
+          cd src
+          xcodebuild archive \
+            -workspace Telegram-Mac.xcworkspace \
+            -scheme Release \
+            -configuration Release \
+            -archivePath ./telegrammacos.xcarchive \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) STABLE' \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          cd src
+          cp -R telegrammacos.xcarchive/Products/Applications/Telegram.app ./
+          cp -R telegrammacos.xcarchive/dSYMs/Telegram.app.dSYM ./
+          codesign --force --deep --sign - Telegram.app || true
+          ditto -c -k --sequesterRsrc --keepParent Telegram.app Telegram.app.zip
+          ditto -c -k --sequesterRsrc --keepParent Telegram.app.dSYM Telegram.app.dSYM.zip
+          ls -lh Telegram.app.zip
+
+      - name: Upload Telegram.app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-macOS-app
+          path: src/Telegram.app.zip
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload dSYM
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-macOS-dSYM
+          path: src/Telegram.app.dSYM.zip
+          retention-days: 1
+          if-no-files-found: warn
